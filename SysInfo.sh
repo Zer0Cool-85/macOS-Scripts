@@ -133,6 +133,7 @@ UPTIME="$(get_uptime_dhm)"
 IPINFO="$(get_ip_summary)"
 JAMFINFO="$(get_jamf_status)"
 
+INFO_BLOCK=$(
 cat <<EOF
 ==============================
  System Info for Help Desk
@@ -147,6 +148,7 @@ Jamf Status:
 $JAMFINFO
 ==============================
 EOF
+)
 
 # ---------- SwiftDialog popup ----------
 
