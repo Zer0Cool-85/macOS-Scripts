@@ -1,12 +1,14 @@
 #!/bin/bash
 
-# ----------------------------
-# System Info for Help Desk
-# ----------------------------
+DIALOG="/usr/local/bin/dialog"
+TITLE="System Info for Help Desk"
+ICON="SF=laptopcomputer.and.arrow.down,weight=semibold"
+BANNER="SF=person.text.rectangle,weight=semibold"
+
+# ---------- Collectors ----------
 
 get_serial() {
-  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
-    | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}'
+  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}'
 }
 
 get_os() {
@@ -18,24 +20,16 @@ get_os() {
 }
 
 get_model_marketing() {
-  # Works on macOS 11+; uses Apple’s model database if available
-  local model_id marketing
+  local model_id marketing plist
   model_id="$(sysctl -n hw.model 2>/dev/null)"
-
-  marketing="$(/usr/libexec/PlistBuddy -c "Print :$model_id" \
-    /System/Library/PrivateFrameworks/DeviceIdentity.framework/Versions/A/Resources/DeviceIdentityModelInfo.plist 2>/dev/null)"
-
-  if [[ -n "$marketing" ]]; then
-    printf "%s" "$marketing"
-  else
-    # Fallback: show model identifier
-    printf "%s" "$model_id"
-  fi
+  plist="/System/Library/PrivateFrameworks/DeviceIdentity.framework/Versions/A/Resources/DeviceIdentityModelInfo.plist"
+  marketing="$(/usr/libexec/PlistBuddy -c "Print :$model_id" "$plist" 2>/dev/null)"
+  [[ -n "$marketing" ]] && printf "%s" "$marketing" || printf "%s" "$model_id"
 }
 
 get_uptime_dhm() {
   local boot now diff days hours mins
-  boot="$(sysctl -n kern.boottime | awk -F'[ ,}]+' '{print $4}')"  # epoch seconds
+  boot="$(sysctl -n kern.boottime | awk -F'[ ,}]+' '{print $4}')"
   now="$(date +%s)"
   diff=$(( now - boot ))
 
@@ -53,15 +47,10 @@ get_uptime_dhm() {
 }
 
 get_ip_summary() {
-  # Best-effort: show primary interface + IPv4 (and Wi-Fi name if relevant)
   local primary_if ip4 ssid
-
   primary_if="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  if [[ -n "$primary_if" ]]; then
-    ip4="$(ipconfig getifaddr "$primary_if" 2>/dev/null)"
-  fi
+  [[ -n "$primary_if" ]] && ip4="$(ipconfig getifaddr "$primary_if" 2>/dev/null)"
 
-  # Wi-Fi SSID if on en0 (common) or if airport reports something
   ssid="$(/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null \
     | awk -F': ' '/ SSID/{print $2; exit}')"
 
@@ -72,102 +61,123 @@ get_ip_summary() {
       printf "%s: %s" "$primary_if" "$ip4"
     fi
   else
-    # Fallback: list all active IPv4 addresses
-    ifconfig 2>/dev/null | awk '
-      /^[a-z]/ {iface=$1; sub(":", "", iface)}
-      /status: active/ {active[iface]=1}
-      /inet / && active[iface]==1 {print iface ": " $2}
-    ' | paste -sd ", " -
+    echo "Unknown"
   fi
 }
 
-get_jamf_status() {
+get_last_successful_policy_checkin() {
+  local log="/var/log/jamf.log"
+  [[ -f "$log" ]] || { echo "jamf.log not found"; return 0; }
+
+  awk '
+    /Checking for policies/ {
+      chk_line = $0
+      if (getline next_line) {
+        if (next_line !~ /Could not connect to the JSS/) {
+          last_ok = chk_line
+        }
+      }
+    }
+    END {
+      if (last_ok != "") print last_ok
+      else print "No successful policy check found"
+    }
+  ' "$log"
+}
+
+get_jamf_server_status() {
   local jamf_bin="/usr/local/bin/jamf"
-  local enrolled="Unknown"
-  local server="Unknown"
-  local availability="Unknown"
-  local last_checkin="Unknown"
-  local output
+  local output server availability
 
-  if [[ -x "$jamf_bin" ]]; then
-    enrolled="Yes"
-
-    output="$("$jamf_bin" checkJSSConnection 2>/dev/null)"
-
-    # Extract server URL
-    server="$(echo "$output" \
-      | awk -F' ' '/Checking availability of/ {gsub(/\.\.\./,"",$NF); print $NF; exit}')"
-
-    # Determine availability
-    if echo "$output" | grep -q "The JSS is available"; then
-      availability="Available"
-    else
-      availability="Unavailable"
-    fi
-
-    [[ -n "$server" ]] && server="$server ($availability)"
-
-    # Last Jamf activity (best effort)
-    if [[ -f /var/log/jamf.log ]]; then
-      last_checkin="$(grep -E "Checking for policies|Submitting inventory|Contacting JSS" \
-        /var/log/jamf.log 2>/dev/null | tail -n 1)"
-      [[ -z "$last_checkin" ]] && last_checkin="jamf.log present (no recent entry parsed)"
-    else
-      last_checkin="jamf.log not found"
-    fi
-  else
-    enrolled="No (jamf binary not found)"
-    server="N/A"
-    last_checkin="N/A"
+  if [[ ! -x "$jamf_bin" ]]; then
+    echo "Not Enrolled"
+    return 0
   fi
 
-  printf "Enrolled: %s\nJamf Server: %s\nLast Jamf Activity: %s" \
-    "$enrolled" "$server" "$last_checkin"
+  output="$("$jamf_bin" checkJSSConnection 2>/dev/null)"
+
+  server="$(echo "$output" | awk '/Checking availability of/ {for(i=1;i<=NF;i++) if ($i ~ /^https?:\/\//) {gsub(/\.\.\./,"",$i); print $i; exit}}')"
+
+  if echo "$output" | grep -q "The JSS is available"; then
+    availability="Available"
+  else
+    availability="Unavailable"
+  fi
+
+  server="$(echo "$server" | sed 's|^https\?://||; s|/$||')"
+
+  [[ -n "$server" ]] && echo "$server ($availability)" || echo "Unknown ($availability)"
 }
 
+get_logged_in_user() {
+  # Most reliable for GUI sessions
+  local u
+  u="$(scutil <<< "show State:/Users/ConsoleUser" | awk -F': ' '/Name/ {print $2; exit}')"
+  [[ "$u" == "loginwindow" || -z "$u" ]] && u="$(stat -f%Su /dev/console 2>/dev/null)"
+  echo "$u"
+}
 
+get_computer_name() {
+  scutil --get ComputerName 2>/dev/null || hostname
+}
+
+# ---------- Gather values ----------
+
+COMPUTER_NAME="$(get_computer_name)"
+USERNAME="$(get_logged_in_user)"
 SERIAL="$(get_serial)"
 OSINFO="$(get_os)"
 MODEL="$(get_model_marketing)"
 UPTIME="$(get_uptime_dhm)"
 IPINFO="$(get_ip_summary)"
-JAMFINFO="$(get_jamf_status)"
+JAMF_SERVER="$(get_jamf_server_status)"
+JAMF_LAST_OK="$(get_last_successful_policy_checkin)"
 
 INFO_BLOCK=$(
 cat <<EOF
 ==============================
  System Info for Help Desk
 ==============================
-Serial:      $SERIAL
-Model:       $MODEL
-OS:          $OSINFO
-Uptime:      $UPTIME
-IP:          $IPINFO
+Computer Name: $COMPUTER_NAME
+Username:      $USERNAME
+Serial:        $SERIAL
+Model:         $MODEL
+OS:            $OSINFO
+Uptime:        $UPTIME
+IP:            $IPINFO
 
-Jamf Status:
-$JAMFINFO
+Jamf Server:   $JAMF_SERVER
+Last Successful Policy Check:
+$JAMF_LAST_OK
 ==============================
 EOF
 )
 
-# ---------- SwiftDialog popup ----------
+# ---------- SwiftDialog ----------
 
-# If dialog is missing, just print to stdout
+# If dialog missing, print block and exit
 if [[ ! -x "$DIALOG" ]]; then
   echo "$INFO_BLOCK"
   exit 0
 fi
 
-# Write block to a temp file for --textbox
-TMPFILE="$(mktemp /tmp/helpdesk_system_info.XXXXXX)"
-printf "%s\n" "$INFO_BLOCK" > "$TMPFILE"
-
-# Show dialog with a Copy button
+# Make the dialog "fancier":
+# - Use a banner icon
+# - Use a clean key-value layout with textfields (read-only display)
+# - Provide Copy + Close buttons
 "$DIALOG" \
   --title "$TITLE" \
-  --message "Copy the block below and paste it into your help desk ticket." \
   --icon "$ICON" \
-  --textbox "$TMPFILE" \
+  --bannerimage "$BANNER" \
+  --message "**Copy-friendly summary** (click *Copy* to copy the full help-desk block to your clipboard):" \
+  --textfield "Computer Name: $COMPUTER_NAME" \
+  --textfield "Username: $USERNAME" \
+  --textfield "Serial: $SERIAL" \
+  --textfield "Model: $MODEL" \
+  --textfield "OS: $OSINFO" \
+  --textfield "Uptime: $UPTIME" \
+  --textfield "IP: $IPINFO" \
+  --textfield "Jamf: $JAMF_SERVER" \
   --button1text "Copy" \
   --button2text "Close" \
   --ontop \
@@ -176,17 +186,15 @@ printf "%s\n" "$INFO_BLOCK" > "$TMPFILE"
 
 rc=$?
 
-# If user clicked "Copy" (button 1), copy the block to clipboard
 if [[ "$rc" -eq 0 ]]; then
   printf "%s" "$INFO_BLOCK" | pbcopy
   "$DIALOG" \
     --title "$TITLE" \
-    --message "Copied to clipboard ✅\n\nPaste it into your ticket." \
     --icon "$ICON" \
+    --message "Copied to clipboard ✅\n\nPaste it into your help desk ticket." \
     --button1text "OK" \
     --mini \
     --ontop
 fi
 
-rm -f "$TMPFILE"
 exit 0
