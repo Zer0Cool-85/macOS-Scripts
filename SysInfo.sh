@@ -147,3 +147,44 @@ Jamf Status:
 $JAMFINFO
 ==============================
 EOF
+
+# ---------- SwiftDialog popup ----------
+
+# If dialog is missing, just print to stdout
+if [[ ! -x "$DIALOG" ]]; then
+  echo "$INFO_BLOCK"
+  exit 0
+fi
+
+# Write block to a temp file for --textbox
+TMPFILE="$(mktemp /tmp/helpdesk_system_info.XXXXXX)"
+printf "%s\n" "$INFO_BLOCK" > "$TMPFILE"
+
+# Show dialog with a Copy button
+"$DIALOG" \
+  --title "$TITLE" \
+  --message "Copy the block below and paste it into your help desk ticket." \
+  --icon "$ICON" \
+  --textbox "$TMPFILE" \
+  --button1text "Copy" \
+  --button2text "Close" \
+  --ontop \
+  --width 820 \
+  --height 520
+
+rc=$?
+
+# If user clicked "Copy" (button 1), copy the block to clipboard
+if [[ "$rc" -eq 0 ]]; then
+  printf "%s" "$INFO_BLOCK" | pbcopy
+  "$DIALOG" \
+    --title "$TITLE" \
+    --message "Copied to clipboard ✅\n\nPaste it into your ticket." \
+    --icon "$ICON" \
+    --button1text "OK" \
+    --mini \
+    --ontop
+fi
+
+rm -f "$TMPFILE"
+exit 0
