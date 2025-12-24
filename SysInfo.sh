@@ -84,19 +84,33 @@ get_ip_summary() {
 get_jamf_status() {
   local jamf_bin="/usr/local/bin/jamf"
   local enrolled="Unknown"
-  local last_checkin="Unknown"
   local server="Unknown"
+  local availability="Unknown"
+  local last_checkin="Unknown"
+  local output
 
   if [[ -x "$jamf_bin" ]]; then
     enrolled="Yes"
 
-    # "jamf checkJSSConnection" prints connection info; keep it light
-    server="$("$jamf_bin" checkJSSConnection 2>/dev/null | awk -F': ' '/Checking connection to/{print $2; exit}')"
-    [[ -z "$server" ]] && server="Connected (server not parsed)"
+    output="$("$jamf_bin" checkJSSConnection 2>/dev/null)"
 
-    # Last check-in is commonly present in jamf.log
+    # Extract server URL
+    server="$(echo "$output" \
+      | awk -F' ' '/Checking availability of/ {gsub(/\.\.\./,"",$NF); print $NF; exit}')"
+
+    # Determine availability
+    if echo "$output" | grep -q "The JSS is available"; then
+      availability="Available"
+    else
+      availability="Unavailable"
+    fi
+
+    [[ -n "$server" ]] && server="$server ($availability)"
+
+    # Last Jamf activity (best effort)
     if [[ -f /var/log/jamf.log ]]; then
-      last_checkin="$(grep -E "Checking for policies|Submitting inventory|Contacting JSS" /var/log/jamf.log 2>/dev/null | tail -n 1)"
+      last_checkin="$(grep -E "Checking for policies|Submitting inventory|Contacting JSS" \
+        /var/log/jamf.log 2>/dev/null | tail -n 1)"
       [[ -z "$last_checkin" ]] && last_checkin="jamf.log present (no recent entry parsed)"
     else
       last_checkin="jamf.log not found"
@@ -107,8 +121,10 @@ get_jamf_status() {
     last_checkin="N/A"
   fi
 
-  printf "Enrolled: %s\nJamf Server: %s\nLast Jamf Activity: %s" "$enrolled" "$server" "$last_checkin"
+  printf "Enrolled: %s\nJamf Server: %s\nLast Jamf Activity: %s" \
+    "$enrolled" "$server" "$last_checkin"
 }
+
 
 SERIAL="$(get_serial)"
 OSINFO="$(get_os)"
