@@ -3,7 +3,6 @@
 DIALOG="/usr/local/bin/dialog"
 TITLE="System Info for Help Desk"
 ICON="SF=laptopcomputer.and.arrow.down,weight=semibold"
-BANNER="SF=person.text.rectangle,weight=semibold"
 
 # ---------- Collectors ----------
 
@@ -105,12 +104,10 @@ get_jamf_server_status() {
   fi
 
   server="$(echo "$server" | sed 's|^https\?://||; s|/$||')"
-
   [[ -n "$server" ]] && echo "$server ($availability)" || echo "Unknown ($availability)"
 }
 
 get_logged_in_user() {
-  # Most reliable for GUI sessions
   local u
   u="$(scutil <<< "show State:/Users/ConsoleUser" | awk -F': ' '/Name/ {print $2; exit}')"
   [[ "$u" == "loginwindow" || -z "$u" ]] && u="$(stat -f%Su /dev/console 2>/dev/null)"
@@ -119,6 +116,16 @@ get_logged_in_user() {
 
 get_computer_name() {
   scutil --get ComputerName 2>/dev/null || hostname
+}
+
+md_escape() {
+  # Minimal escape so tables don’t break if values include pipes.
+  # Also strips carriage returns and collapses newlines to spaces.
+  local s="$1"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/ }"
+  s="${s//|/\\|}"
+  echo "$s"
 }
 
 # ---------- Gather values ----------
@@ -132,6 +139,17 @@ UPTIME="$(get_uptime_dhm)"
 IPINFO="$(get_ip_summary)"
 JAMF_SERVER="$(get_jamf_server_status)"
 JAMF_LAST_OK="$(get_last_successful_policy_checkin)"
+
+# Escaped for markdown table safety
+COMPUTER_NAME_MD="$(md_escape "$COMPUTER_NAME")"
+USERNAME_MD="$(md_escape "$USERNAME")"
+SERIAL_MD="$(md_escape "$SERIAL")"
+MODEL_MD="$(md_escape "$MODEL")"
+OSINFO_MD="$(md_escape "$OSINFO")"
+UPTIME_MD="$(md_escape "$UPTIME")"
+IPINFO_MD="$(md_escape "$IPINFO")"
+JAMF_SERVER_MD="$(md_escape "$JAMF_SERVER")"
+JAMF_LAST_OK_MD="$(md_escape "$JAMF_LAST_OK")"
 
 INFO_BLOCK=$(
 cat <<EOF
@@ -153,36 +171,46 @@ $JAMF_LAST_OK
 EOF
 )
 
-# ---------- SwiftDialog ----------
+MESSAGE_MD=$(
+cat <<EOF
+### System Info
 
-# If dialog missing, print block and exit
+| Item | Value |
+|------|-------|
+| **Computer Name** | $COMPUTER_NAME_MD |
+| **Username** | $USERNAME_MD |
+| **Serial** | $SERIAL_MD |
+| **Model** | $MODEL_MD |
+| **OS** | $OSINFO_MD |
+| **Uptime** | $UPTIME_MD |
+| **IP** | $IPINFO_MD |
+| **Jamf** | $JAMF_SERVER_MD |
+
+**Last Successful Policy Check**  
+\`\`\`
+$JAMF_LAST_OK_MD
+\`\`\`
+
+Click **Copy** to copy the full block for your help desk ticket.
+EOF
+)
+
+# ---------- Dialog ----------
+
 if [[ ! -x "$DIALOG" ]]; then
   echo "$INFO_BLOCK"
   exit 0
 fi
 
-# Make the dialog "fancier":
-# - Use a banner icon
-# - Use a clean key-value layout with textfields (read-only display)
-# - Provide Copy + Close buttons
 "$DIALOG" \
   --title "$TITLE" \
   --icon "$ICON" \
-  --bannerimage "$BANNER" \
-  --message "**Copy-friendly summary** (click *Copy* to copy the full help-desk block to your clipboard):" \
-  --textfield "Computer Name: $COMPUTER_NAME" \
-  --textfield "Username: $USERNAME" \
-  --textfield "Serial: $SERIAL" \
-  --textfield "Model: $MODEL" \
-  --textfield "OS: $OSINFO" \
-  --textfield "Uptime: $UPTIME" \
-  --textfield "IP: $IPINFO" \
-  --textfield "Jamf: $JAMF_SERVER" \
+  --message "$MESSAGE_MD" \
   --button1text "Copy" \
   --button2text "Close" \
   --ontop \
-  --width 820 \
-  --height 520
+  --width 900 \
+  --height 620
 
 rc=$?
 
