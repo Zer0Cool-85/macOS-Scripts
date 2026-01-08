@@ -1,4 +1,5 @@
 #!/bin/zsh
+
 ###############################################################################
 # SwiftDialog + Jamf Policy Install Prompt with Deferrals (Reusable Template)
 #
@@ -8,15 +9,8 @@
 #   times. When the user proceeds (or deferrals are exhausted), the script runs
 #   a Jamf policy via a custom event trigger (jamf policy -event <trigger>).
 #
-# WHY THIS EXISTS
-#   - Some apps need to be kept at/above a minimum version for security,
-#     compatibility, or compliance.
-#   - We want a user-friendly prompt (SwiftDialog) and controlled deferrals.
-#   - We want one script that can be reused for ANY application by passing
-#     Jamf script parameters ($4..$12).
-#
-# HIGH-LEVEL FLOW
-#   1) Validate parameters & prerequisites (SwiftDialog exists, app exists).
+# HIGH-LEVEL OVERVIEW
+#   1) Validate Jamf parameters & prerequisites (SwiftDialog exists, app exists).
 #   2) Read installed app version from Info.plist.
 #   3) If already compliant (installed >= required), exit.
 #   4) Determine where to store deferral state (per-user or per-device).
@@ -55,11 +49,12 @@
 #
 # OPTIONAL JAMF PARAMETERS
 #   $8  Additional info text (shown in prompt; can include \n new lines)
-#   $10 Deferral scope: "user" (default) or "device"
-#   $11 Reset mode: "onUpdate" (default) or "never"
-#       - "onUpdate" resets deferrals automatically if the required version
-#         changes in the future (ex: you bump required version from 1.2 -> 1.3)
-#   $12 Shortname override (ex: "iboss" instead of "ibossmacoscloudconnector")
+#   $10 Wait time (seconds) for the progress dialog while install runs (defaults to 60 if unset)
+#   $11 Shortname override (ex: "iboss" instead of "ibossmacoscloudconnector")
+#
+# GLOBALS (edit in a new copy of the script if needed)
+#   deferralScope = "user"  (default) OR "device"
+#   resetMode     = "onUpdate" (default) OR "never"
 #
 # EXAMPLE JAMF POLICY PARAMS
 #   $4  Google Chrome
@@ -68,9 +63,18 @@
 #   $7  3
 #   $8  \n\nThis update takes ~2 minutes.\n\n
 #   $9  install_chrome_latest
-#   $10 user
-#   $11 onUpdate
-#   $12 chrome
+#   $10 120
+#   $11 chrome
+#
+# NOTES ABOUT WaitTime Variable
+#   - Currently the script does not verify if the app successfully installed
+#   - It will only show a progress bar for the predetermined number of seconds
+#   - In a future version the following will be added:
+#       Create a loop to check the Info.plist of the required app
+#       Have the loop sleep for 10 seconds and re-check the plist version
+#       Once the version updates to the required version, kill the loop and set progress to complete
+#       If the version never updates to the required version, check the exit code from the Jamf policy
+#             and present an error prompt to the user that the app failed.
 #
 # NOTES ABOUT VERSION COMPARISON
 #   - We read CFBundleShortVersionString from Info.plist.
@@ -95,22 +99,51 @@ set -u
 autoload is-at-least
 
 ###############################################################################
-# STATIC CONFIG (edit here if you want global defaults)
+# JAMF PARAMETERS
+###############################################################################
+title="${4:-}"
+apptoupdate="${5:-}"
+appversionrequired="${6:-}"
+maxdeferrals="${7:-}"
+additionalinfo="${8:-""}"       # Optional message text
+policytrigger="${9:-}"
+
+# $10 waittime (seconds). If not provided, default to 60.
+waittimeParam="${10:-}"
+if [[ -n "$waittimeParam" ]]; then
+  waittime="$waittimeParam"
+else
+  waittime=60
+fi
+
+# $11 shortname override (optional)
+shortnameOverride="${11:-""}"
+
+###############################################################################
+# GLOBAL CONFIG (these should rarely change)
 ###############################################################################
 dialogapp="/usr/local/bin/dialog"
 
 # Command file used by SwiftDialog for progress updates (a simple text file).
-# /var/tmp persists across reboots more often than /tmp, but is still "temp-ish".
 dialoglog="/var/tmp/dialog.log"
 
 org="test"                      # Used in plist domain: com.<org>.<shortname>.deferrals
 softwareportal="Self Service"   # For messaging only (what end user sees)
-dialogheight="430"
-iconsize="120"
-waittime=60                     # Seconds to show a progress dialog during install
+dialogheight="450"
+iconsize="125"
+maxIdleTime="480" # 8 mins
 
 ###############################################################################
-# HELPERS
+# GLOBAL DEFERRAL BEHAVIOR (edit these in a new copy if needed)
+###############################################################################
+# Standard use:
+#   - per-user deferrals (each user gets their own counter)
+#   - reset deferrals when the required version changes (new update cycle)
+deferralScope="user"     # "user" or "device"
+resetMode="onUpdate"     # "onUpdate" or "never"
+
+###############################################################################
+# SCRIPT FUNCTIONS
 ###############################################################################
 
 # Basic logger to stdout (Jamf will capture in policy logs/jamf.log output)
@@ -121,7 +154,7 @@ get_console_user() {
   /usr/sbin/scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ {print $3}' | head -n 1
 }
 
-# Normalize a title into a safe "shortname" used in plist filenames/domains.
+# Normalize a title into a "shortname" used in plist filenames/domains.
 # - lowercases
 # - strips anything not a-z or 0-9
 # Examples:
@@ -140,7 +173,7 @@ get_short_version() {
   /usr/bin/defaults read "${app}/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || true
 }
 
-# defaults wrappers that work with explicit plist file paths (recommended here).
+# defaults wrappers that work with explicit plist file paths.
 # Why explicit file paths?
 #   - Easier to reason about where data lives (especially for per-user files).
 #   - Makes troubleshooting simple (open the plist file directly if needed).
@@ -161,29 +194,88 @@ d_delete_key() {
   /usr/bin/defaults delete "$plist" "$key" 2>/dev/null || true
 }
 
-###############################################################################
-# INPUT PARAMETERS (Jamf passes script parameters starting at $4)
-###############################################################################
-title="${4:-}"
-apptoupdate="${5:-}"
-appversionrequired="${6:-}"
-maxdeferrals="${7:-}"
-additionalinfo="${8:-""}"       # Optional message text
-policytrigger="${9:-}"
+# Check if there is currently a logged in user
+checkForLoggedInUser() {
+    log "Logged in user: $consoleUser"
+    if [[ -z "$consoleUser" ]]; then
+        log "No user logged in."
+        exit 0
+    fi
+}
 
-deferralScope="${10:-user}"     # "user" (default) or "device"
-resetMode="${11:-onUpdate}"     # "onUpdate" (default) or "never"
-shortnameOverride="${12:-""}"   # Optional override for shortname derived from title
+# Check system idle time to avoid prompting a user if they have been idle for a period of time
+checkForHIDIdleTime() {
+    HIDIdleTime="$(/usr/sbin/ioreg -c IOHIDSystem | /usr/bin/awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')"
+    log "Current idle time: $HIDIdleTime"
+    if [[ "$HIDIdleTime" -gt "$maxIdleTime" ]]; then
+        log "Exiting script since the computer has been idle for $HIDIdleTime seconds."
+        exit 0
+    fi
+}
+
+# Function to do "best effort" check if using presentation or web conferencing is active
+checkForDisplaySleepAssertions() {
+    Assertions="$(/usr/bin/pmset -g assertions | /usr/bin/awk '/NoDisplaySleepAssertion | PreventUserIdleDisplaySleep/ && match($0,/\(.+\)/) && ! /coreaudiod/ {gsub(/^\ +/,"",$0); print};')"
+    
+    # There are multiple types of power assertions an app can assert.
+    # These specifically tend to be used when an app wants to try and prevent the OS from going to display sleep.
+    # Scenarios where an app may not want to have the display going to sleep include, but are not limited to:
+    #   Presentation (KeyNote, PowerPoint)
+    #   Web conference software (Zoom, Webex)
+    #   Screen sharing session
+    # Apps have to make the assertion and therefore it's possible some apps may not get captured.
+    # Some assertions can be found here: https://developer.apple.com/documentation/iokit/iopmlib_h/iopmassertiontypes
+    if [[ "$Assertions" ]]; then
+        echo "The following display-related power assertions have been detected:"
+        echo "$Assertions"
+        echo "Exiting script to avoid disrupting user while these power assertions are active."
+        
+        exit 0
+    fi
+}
 
 ###############################################################################
-# BASIC VALIDATION
+#   USER, COMPUTER, AND GREETING VARIABLES
 ###############################################################################
+
+consoleUser="$(get_console_user)"
+computerName=$( scutil --get ComputerName )
+loggedInUserFullName=$(id -F "${consoleUser}")
+loggedInUserFirstName=$(echo "$loggedInUserFullName" | awk '{print $1}')
+
+# Generate greeting based on current hour
+currentHour=$(date +"%H")
+if [ "$currentHour" -ge 5 ] && [ "$currentHour" -lt 12 ]; then
+    timeGreeting="Good morning"
+elif [ "$currentHour" -ge 12 ] && [ "$currentHour" -lt 17 ]; then
+    timeGreeting="Good afternoon"
+else
+    timeGreeting="Good evening"
+fi
+
+###############################################################################
+# PRE-FLIGHT VALIDATION
+###############################################################################
+
+# Ensure user is logged in, not idle for more than 8 minutes, and not in a meeting
+checkForLoggedInUser
+checkForHIDIdleTime
+checkForDisplaySleepAssertions
+
+# Ensure that all mandatory Jamf params are set
 if [[ -z "$title" || -z "$apptoupdate" || -z "$appversionrequired" || -z "$maxdeferrals" || -z "$policytrigger" ]]; then
   log "ERROR: Missing required Jamf parameters."
   log "Required: $4 title, $5 app path, $6 required version, $7 max deferrals, $9 policy trigger"
   exit 1
 fi
 
+# Ensure waittime is an integer >= 0
+if ! [[ "$waittime" =~ '^[0-9]+$' ]]; then
+  log "ERROR: waittime must be a non-negative integer. Got: $waittime"
+  exit 1
+fi
+
+# Ensure SwiftDialog is installed
 if [[ ! -x "$dialogapp" ]]; then
   log "ERROR: SwiftDialog not found at $dialogapp"
   exit 1
@@ -310,29 +402,36 @@ else
   infobuttontext="Max Deferrals Reached"
 fi
 
-# Build message using SwiftDialog markdown formatting.
-# NOTE: Use \n new lines; SwiftDialog supports GitHub-ish markdown for **bold**
-message="${org} requires **${title}** to be updated to version **${appversionrequired}**.\n\n\
-_Current version: **${installedappversion}**_\n\
-_Remaining Deferrals: **${remaining}**_\n\n\
-${additionalinfo}\n\
-You can also update at any time from ${softwareportal}. Search for **${title}**."
+# Build message and infobox using SwiftDialog markdown formatting.
+# NOTE: Use \n new lines; SwiftDialog supports GitHub style markdown
+message="## **${title}** - Update \n\n \
+${timeGreeting}, ${loggedInUserFirstName}! \n\n \
+An update for ${title} is required.\n\n We will be installing version **${appversionrequired}**\n\n \
+${additionalinfo}\n \
+Please click **Continue** to start the installation now, or you can also update at any time from ${softwareportal}\n\n
+_Install will start automatically when the timer expires_"
+
+infobox="#### Computer Name  \n - ${computerName} \
+\n#### Current App Version \
+\n - ${installedappversion} \
+\n#### Remaining Deferrals \
+\n - ${remaining}"
 
 ###############################################################################
 # SHOW MAIN PROMPT
 ###############################################################################
 "$dialogapp" \
-  --title "${title} Update" \
-  --titlefont colour=#00a4c7 \
+  --title "" \
   --icon "${apptoupdate}" \
+  --background colour=black \
   --message "${message}" \
   --infobuttontext "${infobuttontext}" \
+  --infobox "${infobox}" \
+  --timer 3600 \
   --button1text "Continue" \
   --height "${dialogheight}" \
   --iconsize "${iconsize}" \
-  --quitoninfo \
-  --alignment centre \
-  --centreicon
+  --quitoninfo
 
 dialogExit=$?
 
@@ -352,13 +451,12 @@ fi
 # If we reach here:
 #   - User clicked "Continue", OR
 #   - They attempted to defer with 0 remaining (treated as continue), OR
-#   - Some other exit code occurred (we still proceed to enforcement).
+#   - Some other exit code occurred like timer expired (we still proceed to enforcement).
 log "INFO: Proceeding with installation via Jamf trigger '$policytrigger'"
 
 # Optional cleanup:
 # Original behavior removed deferral count once user continues.
 # This makes the next prompt (if it happens again) start at a fresh max.
-# Some orgs prefer to keep state for audit/tracking; choose what you prefer.
 d_delete_key "$plist" Remaining
 d_delete_key "$plist" LastDeferEpoch
 
@@ -372,13 +470,14 @@ rm -f "$dialoglog" 2>/dev/null || true
 "$dialogapp" \
   --title "${title} Install" \
   --icon "${apptoupdate}" \
+  --background colour=black \
   --height 230 \
   --progress "${waittime}" \
   --progresstext "" \
   --message "Please wait while ${title} is installed..." \
   --commandfile "$dialoglog" &
 
-# Drive progress bar forward for $waittime seconds
+# Control progress bar for $waittime seconds
 for ((i=1; i<=waittime; i++)); do
   echo "progress: increment" >> "$dialoglog"
   sleep 1
@@ -395,6 +494,8 @@ done &
 # This is the enforcement/install step. The policy should:
 #   - install/update the app
 #   - handle any required user prompts (if unavoidable)
-#   - return an appropriate exit code
+#   - return an exit code
 /usr/local/bin/jamf policy -event "$policytrigger"
-exit $?
+jamfExit=$?
+log "INFO: Jamf policy exit status - $jamfExit"
+exit $jamfExit
