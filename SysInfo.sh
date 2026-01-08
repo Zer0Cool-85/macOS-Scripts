@@ -1,13 +1,23 @@
 #!/bin/bash
 
-DIALOG="/usr/local/bin/dialog"
-TITLE="System Info for Help Desk"
-ICON="SF=laptopcomputer.and.arrow.down,weight=semibold"
+# ----------------------------
+# System Info dialog prompt
+# ----------------------------
 
-# ---------- Collectors ----------
+get_logged_in_user() {
+  local u
+  u="$(scutil <<< "show State:/Users/ConsoleUser" | awk -F': ' '/Name/ {print $2; exit}')"
+  [[ "$u" == "loginwindow" || -z "$u" ]] && u="$(stat -f%Su /dev/console 2>/dev/null)"
+  echo "$u"
+}
+
+get_computer_name() {
+  scutil --get ComputerName 2>/dev/null || hostname
+}
 
 get_serial() {
-  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}'
+  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+    | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}'
 }
 
 get_os() {
@@ -19,16 +29,42 @@ get_os() {
 }
 
 get_model_marketing() {
-  local model_id marketing plist
-  model_id="$(sysctl -n hw.model 2>/dev/null)"
-  plist="/System/Library/PrivateFrameworks/DeviceIdentity.framework/Versions/A/Resources/DeviceIdentityModelInfo.plist"
-  marketing="$(/usr/libexec/PlistBuddy -c "Print :$model_id" "$plist" 2>/dev/null)"
-  [[ -n "$marketing" ]] && printf "%s" "$marketing" || printf "%s" "$model_id"
+  # clearing variables
+  MARKETING_MODEL="" 
+  LOGGEDINUSER=""
+  HOME_DIR=""
+
+  # logged in user
+  LOGGEDINUSER=$(stat -f '%Su' /dev/console)
+
+  # logged in user home directory
+  HOME_DIR=$(dscl /Local/Default read /Users/"$LOGGEDINUSER" NFSHomeDirectory | sed 's/NFSHomeDirectory://' | xargs)
+
+      # get model name if Apple Silicon
+      if [ "$(/usr/bin/uname -m)" = 'arm64' ]; then
+          MARKETING_MODEL=$(/usr/libexec/PlistBuddy -c 'print 0:product-name' /dev/stdin <<< "$(/usr/sbin/ioreg -ar -k product-name)")
+
+      # if the machine is not Apple Silicon, we need to quickly open the System Information app as the logged in user and extract the information
+      elif [ "$(/usr/bin/uname -m)" != 'arm64' ]; then
+          if ! [ -e "$HOME_DIR"/Library/Preferences/com.apple.SystemProfiler.plist ]; then
+              su "$LOGGEDINUSER" -l -c 'killall cfprefsd'
+              sleep 2
+              su "$LOGGEDINUSER" -l -c '/usr/bin/open "/System/Library/CoreServices/Applications/About This Mac.app"'
+              sleep 2
+            /usr/bin/pkill -ail 'System Information'
+            sleep 1
+          fi
+          MARKETING_MODEL=$(defaults read "$HOME_DIR"/Library/Preferences/com.apple.SystemProfiler.plist "CPU Names" | awk -F= '{print $2}' | sed 's|[",;]||g' | sed 's/^[\t ]*//g' | sed '/^[[:space:]]*$/d')
+      fi
+
+      if [ "$MARKETING_MODEL" != "" ]; then
+        echo "$MARKETING_MODEL"
+      fi
 }
 
 get_uptime_dhm() {
   local boot now diff days hours mins
-  boot="$(sysctl -n kern.boottime | awk -F'[ ,}]+' '{print $4}')"
+  boot="$(sysctl -n kern.boottime | awk -F'[ ,}]+' '{print $4}')"  # epoch seconds
   now="$(date +%s)"
   diff=$(( now - boot ))
 
@@ -45,181 +81,155 @@ get_uptime_dhm() {
   fi
 }
 
-get_ip_summary() {
-  local primary_if ip4 ssid
-  primary_if="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  [[ -n "$primary_if" ]] && ip4="$(ipconfig getifaddr "$primary_if" 2>/dev/null)"
-
-  ssid="$(/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null \
-    | awk -F': ' '/ SSID/{print $2; exit}')"
-
-  if [[ -n "$primary_if" && -n "$ip4" ]]; then
-    if [[ -n "$ssid" ]]; then
-      printf "%s: %s (Wi-Fi: %s)" "$primary_if" "$ip4" "$ssid"
-    else
-      printf "%s: %s" "$primary_if" "$ip4"
-    fi
-  else
-    echo "Unknown"
-  fi
-}
-
-get_last_successful_policy_checkin() {
-  local log="/var/log/jamf.log"
-  [[ -f "$log" ]] || { echo "jamf.log not found"; return 0; }
-
-  awk '
-    /Checking for policies/ {
-      chk_line = $0
-      if (getline next_line) {
-        if (next_line !~ /Could not connect to the JSS/) {
-          last_ok = chk_line
-        }
-      }
-    }
-    END {
-      if (last_ok != "") print last_ok
-      else print "No successful policy check found"
-    }
-  ' "$log"
-}
-
-get_jamf_server_status() {
+get_jamf_status() {
   local jamf_bin="/usr/local/bin/jamf"
-  local output server availability
+  local enrolled="Unknown"
+  local server="Unknown"
+  local availability="Unknown"
+  local output
 
-  if [[ ! -x "$jamf_bin" ]]; then
-    echo "Not Enrolled"
-    return 0
-  fi
+  if [[ -x "$jamf_bin" ]]; then
+    enrolled="Yes"
 
-  output="$("$jamf_bin" checkJSSConnection 2>/dev/null)"
+    # "jamf checkJSSConnection" prints connection info
+    output="$("$jamf_bin" checkJSSConnection 2>/dev/null)"
 
-  server="$(echo "$output" | awk '/Checking availability of/ {for(i=1;i<=NF;i++) if ($i ~ /^https?:\/\//) {gsub(/\.\.\./,"",$i); print $i; exit}}')"
+    # Extract server URL
+    server="$(echo "$output" \
+      | awk -F' ' '/Checking availability of/ {gsub(/\.\.\./,"",$NF); print $NF; exit}')"
 
-  if echo "$output" | grep -q "The JSS is available"; then
-    availability="Available"
+    # Determine availability
+    if echo "$output" | grep -q "The JSS is available"; then
+      availability="Available"
+    else
+      availability="Unavailable"
+    fi
+    server="$(echo "$server" | sed 's|^https://||; s|/$||')"
+    [[ -n "$server" ]] && server="$server ($availability)"
+
   else
-    availability="Unavailable"
+    enrolled="No (jamf binary not found)"
+    server="N/A"
   fi
 
-  server="$(echo "$server" | sed 's|^https\?://||; s|/$||')"
-  [[ -n "$server" ]] && echo "$server ($availability)" || echo "Unknown ($availability)"
+  printf "Jamf Server: %s" "$server"
 }
 
-get_logged_in_user() {
-  local u
-  u="$(scutil <<< "show State:/Users/ConsoleUser" | awk -F': ' '/Name/ {print $2; exit}')"
-  [[ "$u" == "loginwindow" || -z "$u" ]] && u="$(stat -f%Su /dev/console 2>/dev/null)"
-  echo "$u"
+get_jamf_checkin() {
+  local availability="Unknown"
+  local last_checkin="Unknown"
+  local last_invUpdate="Unknown"
+
+    # Last check-in and inventory is usually present in jamf.log
+    # Scrape log for the most recent time stamps of these actions
+    if [[ -f /var/log/jamf.log ]]; then
+      last_checkin="$(grep -E "recurring check-in" /var/log/jamf.log 2>/dev/null | tail -n 1 | awk '{print $1, $2, $3, $4}')"
+      [[ -z "$last_checkin" ]] && last_checkin="Unknown"
+    else
+      last_checkin="Unknown"
+    fi
+    if [[ -f /var/log/jamf.log ]]; then
+      last_invUpdate="$(grep -E "Update Inventory" /var/log/jamf.log 2>/dev/null | tail -n 1 | awk '{print $1, $2, $3, $4}')"
+      [[ -z "$last_invUpdate" ]] && last_invUpdate="Unknown"
+    else
+      last_invUpdate="Unknown"
+    fi
+
+  printf "Last Check-in: %s\nLast Inventory: %s" "$last_checkin" "$last_invUpdate"
 }
 
-get_computer_name() {
-  scutil --get ComputerName 2>/dev/null || hostname
-}
-
-md_escape() {
-  # Minimal escape so tables don’t break if values include pipes.
-  # Also strips carriage returns and collapses newlines to spaces.
-  local s="$1"
-  s="${s//$'\r'/}"
-  s="${s//$'\n'/ }"
-  s="${s//|/\\|}"
-  echo "$s"
-}
-
-# ---------- Gather values ----------
-
+# Create variables
 COMPUTER_NAME="$(get_computer_name)"
 USERNAME="$(get_logged_in_user)"
 SERIAL="$(get_serial)"
 OSINFO="$(get_os)"
 MODEL="$(get_model_marketing)"
 UPTIME="$(get_uptime_dhm)"
-IPINFO="$(get_ip_summary)"
-JAMF_SERVER="$(get_jamf_server_status)"
-JAMF_LAST_OK="$(get_last_successful_policy_checkin)"
+IPINFO=$(ifconfig | grep 'inet ' | grep -v '127.0.0.1' | grep -v '192.*' | awk '{print $2}')
+JAMFINFO="$(get_jamf_status)"
+JAMFINFO2="$(get_jamf_checkin)"
+SERVER="$(get_jamf_status | grep "Jamf Server:" | awk '{print $3}')"
+LAST_CHECKIN="$(get_jamf_checkin | grep "Last Check-in:" | awk '{print $3, $4, $5, $6}')"
+LAST_INVUPDATE="$(get_jamf_checkin | grep "Last Inventory:" | awk '{print $3, $4, $5, $6}')"
 
-# Escaped for markdown table safety
-COMPUTER_NAME_MD="$(md_escape "$COMPUTER_NAME")"
-USERNAME_MD="$(md_escape "$USERNAME")"
-SERIAL_MD="$(md_escape "$SERIAL")"
-MODEL_MD="$(md_escape "$MODEL")"
-OSINFO_MD="$(md_escape "$OSINFO")"
-UPTIME_MD="$(md_escape "$UPTIME")"
-IPINFO_MD="$(md_escape "$IPINFO")"
-JAMF_SERVER_MD="$(md_escape "$JAMF_SERVER")"
-JAMF_LAST_OK_MD="$(md_escape "$JAMF_LAST_OK")"
-
+# Generate variable for use when copying the information from the dialog prompt
 INFO_BLOCK=$(
 cat <<EOF
-==============================
- System Info for Help Desk
-==============================
+------------------------------
+         System Info 
+------------------------------
 Computer Name: $COMPUTER_NAME
-Username:      $USERNAME
-Serial:        $SERIAL
-Model:         $MODEL
-OS:            $OSINFO
-Uptime:        $UPTIME
-IP:            $IPINFO
+Username: $USERNAME
+Serial: $SERIAL
+Model: $MODEL
+OS: $OSINFO
+Uptime: $UPTIME
+IP: $IPINFO
 
-Jamf Server:   $JAMF_SERVER
-Last Successful Policy Check:
-$JAMF_LAST_OK
-==============================
+------------------------------
+        Jamf Status
+------------------------------
+$JAMFINFO
+$JAMFINFO2
 EOF
 )
 
-MESSAGE_MD=$(
+# ---------- SwiftDialog popup ----------
+
+# Dialog variables
+DIALOG="/usr/local/bin/dialog"
+ICON="SF=laptopcomputer.and.arrow.down,weight=semibold"
+
+# Create message content for dialog window using markdown format with tables
+MESSAGE=$(
 cat <<EOF
-### System Info
-
-| Item | Value |
+## System Info
+|  |  |
 |------|-------|
-| **Computer Name** | $COMPUTER_NAME_MD |
-| **Username** | $USERNAME_MD |
-| **Serial** | $SERIAL_MD |
-| **Model** | $MODEL_MD |
-| **OS** | $OSINFO_MD |
-| **Uptime** | $UPTIME_MD |
-| **IP** | $IPINFO_MD |
-| **Jamf** | $JAMF_SERVER_MD |
-
-**Last Successful Policy Check**  
-\`\`\`
-$JAMF_LAST_OK_MD
-\`\`\`
-
-Click **Copy** to copy the full block for your help desk ticket.
+| **Computer Name** | $COMPUTER_NAME |
+| **Username** | $USERNAME |
+| **Serial** | $SERIAL |
+| **Model** | $MODEL |
+| **OS** | $OSINFO |
+| **Uptime** | $UPTIME |
+| **IP Address** | $IPINFO |
+<br><br>
+## Jamf Information
+|  |  |
+|------|-------|
+| **Jamf Server** | $SERVER |
+| **Last Check-in** | $LAST_CHECKIN |
+| **Last Inventory** | $LAST_INVUPDATE |
+<br><br>
+>Click **Copy** to copy all information to your clipboard.
 EOF
 )
 
-# ---------- Dialog ----------
-
+# If dialog is missing, just print to stdout
 if [[ ! -x "$DIALOG" ]]; then
   echo "$INFO_BLOCK"
   exit 0
 fi
 
+# Show dialog with a Copy button
 "$DIALOG" \
-  --title "$TITLE" \
+  --title "" \
   --icon "$ICON" \
-  --message "$MESSAGE_MD" \
+  --message "$MESSAGE" \
   --button1text "Copy" \
   --button2text "Close" \
   --ontop \
-  --width 900 \
-  --height 620
-
+  --width 820 \
+  --height 650
 rc=$?
 
+# If user clicked "Copy" (button 1), copy the block to clipboard and present another popup
 if [[ "$rc" -eq 0 ]]; then
   printf "%s" "$INFO_BLOCK" | pbcopy
   "$DIALOG" \
     --title "$TITLE" \
+    --message "Copied system information to clipboard ✅\n\nPaste info into your ticket or chat with support." \
     --icon "$ICON" \
-    --message "Copied to clipboard ✅\n\nPaste it into your help desk ticket." \
     --button1text "OK" \
     --mini \
     --ontop
